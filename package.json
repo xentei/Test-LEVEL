@@ -1,0 +1,12 @@
+{
+  "name": "level-bot",
+  "version": "1.0.0",
+  "main": "bot.js",
+  "type": "module",
+  "dependencies": {
+    "node-fetch": "^3.3.2",
+    "node-telegram-bot-api": "^0.61.0",
+    "dotenv": "^16.0.3",
+    "cron": "^3.1.0"
+  }
+}
