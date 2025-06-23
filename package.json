@@ -1,12 +1,18 @@
 {
-  "name": "level-bot",
+  "name": "flight-bot",
   "version": "1.0.0",
+  "description": "Bot de Telegram para monitorear precios de vuelos.",
   "main": "bot.js",
-  "type": "module",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "keywords": ["telegram", "bot", "vuelos", "flight", "level"],
+  "author": "xentei",
+  "license": "MIT",
   "dependencies": {
-    "node-fetch": "^3.3.2",
-    "node-telegram-bot-api": "^0.61.0",
+    "cron": "^2.3.1",
     "dotenv": "^16.0.3",
-    "cron": "^3.1.0"
+    "node-fetch": "^2.6.1",
+    "node-telegram-bot-api": "^0.61.0"
   }
 }
