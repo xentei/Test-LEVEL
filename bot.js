@@ -1,58 +1,50 @@
 import fetch from 'node-fetch';
 import TelegramBot from 'node-telegram-bot-api';
-import { config } from 'dotenv';
-import { CronJob } from 'cron';
+import 'dotenv/config';
+import cron from 'cron';
 
-config();
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const API_URL = process.env.API_URL; // Debe devolver JSON válido
+const PRICE_THRESHOLD = parseFloat(process.env.PRICE_THRESHOLD) || 250;
 
-const token = process.env.TELEGRAM_TOKEN;
-const chatId = process.env.TELEGRAM_CHAT_ID;
-const threshold = parseFloat(process.env.PRICE_THRESHOLD);
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
 
-const bot = new TelegramBot(token);
+let initialized = false;
 
-const apiUrl = 'https://www.flylevel.com/mwe/flights/api/calendar/?triptype=RT&origin=EZE&destination=BCN&outboundDate=2026-03-08&month=03&year=2026&currencyCode=USD';
-
-let startupMessageSent = false;
-
-async function checkPrices() {
+const sendMessage = async (message) => {
   try {
-    const res = await fetch(apiUrl, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
-        "Accept": "application/json",
-        "Referer": "https://www.flylevel.com/Flight/select?culture=es-ES&triptype=RT&ol=EZE&dl=BCN&dd1=2026-03-08"
-      }
-    });
-
-    const text = await res.text();
-    let data;
-
-    try {
-      data = JSON.parse(text);
-    } catch {
-      console.error('❌ La respuesta no es JSON. Probablemente la API devolvió HTML o un error de autenticación.');
-      return;
-    }
-
-    if (data?.data?.dayPrices) {
-      for (let day of data.data.dayPrices) {
-        if (day.price < threshold) {
-          const msg = `📢 ¡Oferta encontrada!\n📅 Fecha: ${day.date}\n💲 Precio: $${day.price}`;
-          await bot.sendMessage(chatId, msg);
-        }
-      }
-    }
-
+    await bot.sendMessage(TELEGRAM_CHAT_ID, message, { parse_mode: 'Markdown' });
   } catch (err) {
-    console.error('Error al consultar la API:', err.message);
+    console.error("Error enviando mensaje:", err.message);
   }
-}
+};
 
-if (!startupMessageSent) {
-  bot.sendMessage(chatId, '🚀 El bot de vuelos ha iniciado correctamente.');
-  startupMessageSent = true;
-}
+const fetchFlightData = async () => {
+  try {
+    const res = await fetch(API_URL);
+    const data = await res.json();
 
-const job = new CronJob('*/2 * * * *', checkPrices, null, true, 'America/Argentina/Buenos_Aires');
-job.start();
+    if (!Array.isArray(data.vuelos)) throw new Error("Formato inesperado");
+
+    const ofertas = data.vuelos.filter(vuelo => vuelo.precio < PRICE_THRESHOLD);
+
+    if (!initialized) {
+      initialized = true;
+      await sendMessage("🚀 El bot de vuelos ha iniciado correctamente.");
+    }
+
+    if (ofertas.length > 0) {
+      for (const vuelo of ofertas) {
+        await sendMessage(`🔔 *¡Oferta encontrada!*\n📅 Fecha: ${vuelo.fecha}\n💵 Precio: $${vuelo.precio}`);
+      }
+    }
+  } catch (err) {
+    console.error("Error al consultar la API:", err.message);
+  }
+};
+
+// Ejecutar cada 2 minutos
+const job = new cron.CronJob('*/2 * * * *', fetchFlightData, null, true, 'America/Argentina/Buenos_Aires');
+
+console.log("🟢 Servicio iniciado.");
