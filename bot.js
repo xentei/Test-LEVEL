@@ -11,7 +11,7 @@ const threshold = parseFloat(process.env.PRICE_THRESHOLD);
 
 const bot = new TelegramBot(token);
 
-// Mensaje de inicio (solo una vez al arrancar)
+// ✅ Mensaje de inicio: se envía solo una vez
 bot.sendMessage(chatId, '🚀 El bot de vuelos ha iniciado correctamente.');
 
 const apiUrl = 'https://www.flylevel.com/nwe/flights/api/calendar/?triptype=RT&origin=EZE&destination=BCN&outboundDate=2026-03-08&month=03&year=2026&currencyCode=USD';
@@ -28,32 +28,20 @@ async function checkPrices() {
 
     const data = await res.json();
 
-    if (data && data.data && data.data.dayPrices) {
-      let ofertas = 0;
-
+    if (data?.data?.dayPrices) {
       for (let day of data.data.dayPrices) {
         if (day.price < threshold) {
-          const date = day.date;
-          const price = day.price;
-          const msg = `🔔 ¡Oferta encontrada!\n📅 Fecha: ${date}\n💲 Precio: $${price}`;
+          const msg = `🔔 ¡Oferta encontrada!\n📅 Fecha: ${day.date}\n💲 Precio: $${day.price}`;
           await bot.sendMessage(chatId, msg);
-          ofertas++;
         }
       }
-
-      if (ofertas === 0) {
-        await bot.sendMessage(chatId, `🔍 No se encontraron vuelos por debajo de $${threshold} en esta consulta.`);
-      }
-
-    } else {
-      console.error('No se encontró la estructura esperada en la respuesta.');
     }
 
   } catch (err) {
-    console.error('Error al consultar la API:', err.message);
+    console.error('❌ Error al consultar la API:', err.message);
   }
 }
 
-// Ejecutar cada 2 minutos
+// 🕑 Ejecutar cada 2 minutos
 const job = new CronJob('*/2 * * * *', checkPrices, null, true, 'America/Argentina/Buenos_Aires');
 job.start();
