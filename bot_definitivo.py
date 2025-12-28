@@ -1,128 +1,395 @@
 import os
-import smtplib
-import pandas as pd
-import re
-import sys
-from email.mime.text import MIMEText
+import json
+import time
+import random
+import logging
+from pathlib import Path
 from datetime import datetime, timedelta
-from playwright.sync_api import sync_playwright
 
-# === TOMA LOS DATOS DE LA CONFIGURACIÓN DE GITHUB ===
-MI_EMAIL = os.environ.get("GMAIL_USER")
-MI_PASS_APP = os.environ.get("GMAIL_PASS")
+import requests
+from dotenv import load_dotenv
 
-PRECIO_OBJETIVO = 850    
-DIAS_MIN_ESTADIA = 7     
-DIAS_MAX_ESTADIA = 25    
-ANIO = 2026              
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("europa-alert")
 
-def enviar_alerta(mejores_vuelos):
-    print(f"📧 ¡ENCONTRÉ VUELOS! Enviando correo...")
-    cuerpo = f"¡Hola! Vuelos encontrados por menos de {PRECIO_OBJETIVO} USD:\n\n"
-    
-    for index, row in mejores_vuelos.head(5).iterrows():
-        linea = (f"✈️ {row['Salida']} -> {row['Regreso']} ({row['Días']}d) | 💰 {row['TOTAL']} USD\n")
-        cuerpo += linea
-    
-    msg = MIMEText(cuerpo)
-    msg['Subject'] = f"🚨 ALERTA VUELO: {mejores_vuelos.iloc[0]['TOTAL']} USD"
-    msg['From'] = MI_EMAIL
-    msg['To'] = MI_EMAIL
+STATE_FILE = Path("state_best.json")
 
+
+# -----------------------------
+# Helpers ENV
+# -----------------------------
+def load_env():
+    load_dotenv(override=True)
+
+
+def env_str(name: str, default: str = "") -> str:
+    return (os.getenv(name) or default).strip()
+
+
+def env_int(name: str, default: int) -> int:
+    v = env_str(name, str(default))
     try:
-        server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
-        server.login(MI_EMAIL, MI_PASS_APP)
-        server.send_message(msg)
-        server.quit()
-        print("✅ Correo enviado.")
-    except Exception as e:
-        print(f"❌ Error correo: {e}")
+        return int(v)
+    except ValueError:
+        return default
 
-def buscar_tramo(origen, destino, anio):
-    print(f"🔎 Buscando {origen}->{destino}...")
-    resultados = []
-    with sync_playwright() as p:
-        # IMPORTANTE: headless=True para la nube
-        browser = p.chromium.launch(headless=True) 
-        page = browser.new_page()
 
-        for mes in range(1, 13):
-            fecha = datetime(anio, mes, 1)
-            f_ida = fecha.strftime("%Y-%m-%d")
-            f_vuelta = (fecha + timedelta(days=7)).strftime("%Y-%m-%d")
-            
-            # URL COMPLETA CON PARÁMETROS MAGICOS
-            url = (f"https://www.flylevel.com/Flight/Select?o1={origen}&d1={destino}"
-                   f"&dd1={f_ida}&dd2={f_vuelta}"
-                   "&ADT=1&CHD=0&INL=0&r=true&mm=true&forcedCurrency=USD&forcedCulture=es-ES&newecom=true")
-            
-            datos_mes = []
-            
-            def interceptar(response):
-                if "calendar" in response.url and response.status == 200:
-                    try:
-                        data = response.json()
-                        lista = []
-                        if isinstance(data, dict) and "data" in data:
-                            lista = data["data"].get("dayPrices", [])
-                        elif isinstance(data, list):
-                            lista = data
-                        for item in lista:
-                            if item.get('price'):
-                                datos_mes.append({"Fecha": item.get('date'), "Precio": item.get('price')})
-                    except: pass
+def env_float(name: str, default: float) -> float:
+    v = env_str(name, str(default))
+    try:
+        return float(v)
+    except ValueError:
+        return default
 
-            page.on("response", interceptar)
+
+def base_url(env_name: str) -> str:
+    return "https://api.amadeus.com" if env_name.lower() == "prod" else "https://test.api.amadeus.com"
+
+
+# -----------------------------
+# Telegram
+# -----------------------------
+def telegram_send(token: str, chat_id: str, text: str) -> None:
+    if not token or not chat_id:
+        log.warning("Telegram no configurado (faltan TELEGRAM_TOKEN / TELEGRAM_CHAT_ID).")
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        r = requests.post(
+            url,
+            data={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+            timeout=15,
+        )
+        if not r.ok:
+            log.warning("Telegram error %s: %s", r.status_code, r.text[:200])
+        else:
+            log.info("Telegram OK.")
+    except requests.RequestException as e:
+        log.warning("Telegram request error: %s", e)
+
+
+# -----------------------------
+# State
+# -----------------------------
+def state_load() -> dict:
+    if not STATE_FILE.exists():
+        return {"best_total": None, "best_offer": None}
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {"best_total": None, "best_offer": None}
+
+
+def state_save(state: dict) -> None:
+    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# -----------------------------
+# Amadeus Client
+# -----------------------------
+class Amadeus:
+    def __init__(self, env_name: str, client_id: str, client_secret: str):
+        self.base = base_url(env_name)
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.token = None
+        self.token_exp = 0.0
+        self.airline_name_cache = {}  # "IB" -> "Iberia"
+
+    def _token_valid(self) -> bool:
+        return bool(self.token) and (time.time() < (self.token_exp - 30))
+
+    def get_token(self) -> str:
+        if self._token_valid():
+            return self.token
+
+        url = f"{self.base}/v1/security/oauth2/token"
+        r = requests.post(
+            url,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "grant_type": "client_credentials",
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        js = r.json()
+        self.token = js["access_token"]
+        self.token_exp = time.time() + int(js.get("expires_in", 900))
+        return self.token
+
+    def _headers(self) -> dict:
+        return {"Authorization": f"Bearer {self.get_token()}"}
+
+    def request(self, method: str, path: str, params: dict | None = None, retries: int = 4) -> requests.Response | None:
+        url = f"{self.base}{path}"
+        params = params or {}
+
+        for attempt in range(1, retries + 1):
             try:
-                page.goto(url)
-                if mes == 1: 
-                    try: page.locator("button#onetrust-accept-btn-handler").click(timeout=3000)
-                    except: pass
-                page.wait_for_timeout(4000) # Espera red
-                if datos_mes: resultados.extend(datos_mes)
-            except: pass
-            page.remove_listener("response", interceptar)
-        
-        browser.close()
-    return pd.DataFrame(resultados)
+                r = requests.request(method, url, headers=self._headers(), params=params, timeout=30)
 
-def ejecutar_bot():
-    print(f"🤖 INICIANDO - {datetime.now()}")
-    if not MI_EMAIL or not MI_PASS_APP:
-        print("❌ Error: No se configuraron las variables de entorno (Secretos).")
+                # token expirado
+                if r.status_code == 401 and attempt < retries:
+                    self.token = None
+                    time.sleep(0.5)
+                    continue
+
+                # backoff
+                if r.status_code in (429, 500, 502, 503, 504) and attempt < retries:
+                    wait = (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+                    log.warning("HTTP %s %s (retry %s/%s) wait %.1fs", r.status_code, path, attempt, retries, wait)
+                    time.sleep(wait)
+                    continue
+
+                return r
+
+            except requests.RequestException as e:
+                if attempt == retries:
+                    log.warning("Request error final %s %s: %s", method, path, e)
+                    return None
+                wait = (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+                log.warning("Request error (retry %s/%s) wait %.1fs: %s", attempt, retries, wait, e)
+                time.sleep(wait)
+
+        return None
+
+    def flight_offers(self, origin: str, dest: str, depart: str, ret: str, adults: int, currency: str, max_results: int):
+        params = {
+            "originLocationCode": origin,
+            "destinationLocationCode": dest,
+            "departureDate": depart,
+            "returnDate": ret,
+            "adults": adults,
+            "currencyCode": currency,
+            "max": max_results,
+        }
+        return self.request("GET", "/v2/shopping/flight-offers", params=params)
+
+    def airline_name(self, code: str) -> str | None:
+        code = (code or "").strip().upper()
+        if not code:
+            return None
+        if code in self.airline_name_cache:
+            return self.airline_name_cache[code]
+
+        # Endpoint: /v1/reference-data/airlines?airlineCodes=IB
+        r = self.request("GET", "/v1/reference-data/airlines", params={"airlineCodes": code}, retries=3)
+        if r is None or not r.ok:
+            self.airline_name_cache[code] = None
+            return None
+
+        try:
+            data = r.json().get("data", []) or []
+            if not data:
+                self.airline_name_cache[code] = None
+                return None
+            name = (data[0].get("businessName") or data[0].get("commonName") or data[0].get("name") or "").strip()
+            self.airline_name_cache[code] = name or None
+            return self.airline_name_cache[code]
+        except Exception:
+            self.airline_name_cache[code] = None
+            return None
+
+
+# -----------------------------
+# Offer parsing
+# -----------------------------
+def pick_cheapest_offer(offers: list[dict]) -> dict | None:
+    if not offers:
+        return None
+    try:
+        return min(offers, key=lambda x: float(x["price"]["total"]))
+    except Exception:
+        return None
+
+
+def extract_airlines(offer: dict) -> dict:
+    validating = offer.get("validatingAirlineCodes", []) or []
+    carriers = set()
+    for it in offer.get("itineraries", []) or []:
+        for seg in it.get("segments", []) or []:
+            cc = (seg.get("carrierCode") or "").strip().upper()
+            if cc:
+                carriers.add(cc)
+    return {"validating": [c.strip().upper() for c in validating if c], "carriers": sorted(carriers)}
+
+
+def format_airlines(am: Amadeus, validating: list[str], carriers: list[str]) -> str:
+    # Priorizamos validating; si no hay, usamos carriers
+    codes = validating or carriers
+    parts = []
+    for c in codes[:5]:  # evitamos spam
+        name = am.airline_name(c)
+        if name:
+            parts.append(f"{name} ({c})")
+        else:
+            parts.append(c)
+    # Si hay más carriers, lo indicamos
+    if len(codes) > 5:
+        parts.append(f"+{len(codes)-5} más")
+    return ", ".join(parts) if parts else "N/D"
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    load_env()
+
+    am_env = env_str("AMADEUS_ENV", "test")
+    am_id = env_str("AMADEUS_CLIENT_ID")
+    am_secret = env_str("AMADEUS_CLIENT_SECRET")
+
+    tg_token = env_str("TELEGRAM_TOKEN")
+    tg_chat = env_str("TELEGRAM_CHAT_ID")
+
+    origin = env_str("ORIGIN", "EZE").upper()
+    currency = env_str("CURRENCY", "USD").upper()
+    max_price = env_int("MAX_PRICE", 1250)
+
+    destinations = [d.strip().upper() for d in env_str("DESTINATIONS", "MAD,BCN,LIS").split(",") if d.strip()]
+
+    start_in_days = env_int("START_IN_DAYS", 30)
+    range_days = env_int("RANGE_DAYS", 180)
+    step_days = env_int("STEP_DAYS", 7)
+
+    dur_min = env_int("DUR_MIN", 15)
+    dur_max = env_int("DUR_MAX", 25)
+
+    adults = env_int("ADULTS", 1)
+    max_results = env_int("MAX", 10)
+    sleep_s = env_float("SLEEP", 0.15)
+
+    log.info(
+        "DEBUG env: TELEGRAM_TOKEN=%s | TELEGRAM_CHAT_ID=%s | AMADEUS_CLIENT_ID=%s",
+        bool(tg_token),
+        bool(tg_chat),
+        bool(am_id),
+    )
+
+    if not am_id or not am_secret:
+        raise RuntimeError("Faltan AMADEUS_CLIENT_ID / AMADEUS_CLIENT_SECRET en .env")
+
+    am = Amadeus(am_env, am_id, am_secret)
+    state = state_load()
+    prev_best = state.get("best_total")
+
+    today = datetime.now().date()
+    start_date = today + timedelta(days=start_in_days)
+    end_date = start_date + timedelta(days=range_days)
+
+    log.info(
+        "Buscando %s -> Europa | destinos=%s | %s..%s | dur=%s-%s | max=%s %s | env=%s",
+        origin,
+        len(destinations),
+        start_date,
+        end_date,
+        dur_min,
+        dur_max,
+        max_price,
+        currency,
+        am_env,
+    )
+
+    best = None  # dict con info del mejor
+
+    dep = start_date
+    while dep <= end_date:
+        depart_str = dep.strftime("%Y-%m-%d")
+
+        for duration in range(dur_min, dur_max + 1):
+            ret_date = dep + timedelta(days=duration)
+            ret_str = ret_date.strftime("%Y-%m-%d")
+
+            for dest in destinations:
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
+
+                r = am.flight_offers(origin, dest, depart_str, ret_str, adults, currency, max_results)
+                if r is None:
+                    continue
+
+                if not r.ok:
+                    log.warning("FAIL %s %s->%s %s/%s : %s", r.status_code, origin, dest, depart_str, ret_str, (r.text or "")[:140])
+                    continue
+
+                js = r.json()
+                offers = js.get("data", []) or []
+                cheapest = pick_cheapest_offer(offers)
+                if not cheapest:
+                    continue
+
+                try:
+                    total = float(cheapest["price"]["total"])
+                except Exception:
+                    continue
+
+                # solo consideramos candidatos por debajo del objetivo
+                if total > max_price:
+                    continue
+
+                air = extract_airlines(cheapest)
+                cand = {
+                    "total": total,
+                    "currency": currency,
+                    "origin": origin,
+                    "dest": dest,
+                    "depart": depart_str,
+                    "return": ret_str,
+                    "duration_days": duration,
+                    "validating": air["validating"],
+                    "carriers": air["carriers"],
+                }
+
+                if best is None or cand["total"] < best["total"]:
+                    best = cand
+                    log.info(
+                        "NUEVO BEST: %.2f %s | %s -> %s (%sd) %s->%s | validating=%s | carriers=%s",
+                        best["total"],
+                        best["currency"],
+                        best["depart"],
+                        best["return"],
+                        best["duration_days"],
+                        best["origin"],
+                        best["dest"],
+                        best["validating"],
+                        best["carriers"],
+                    )
+
+        dep += timedelta(days=step_days)
+
+    if not best:
+        log.info("No encontré nada <= %s %s en el rango.", max_price, currency)
         return
 
-    df_ida = buscar_tramo("EZE", "BCN", ANIO)
-    df_vuelta = buscar_tramo("BCN", "EZE", ANIO)
+    improved = (prev_best is None) or (best["total"] < float(prev_best))
 
-    if df_ida.empty or df_vuelta.empty:
-        print("❌ Sin datos suficientes.")
-        return
+    airline_line = format_airlines(am, best["validating"], best["carriers"])
+    msg = (
+        "✈️ Alerta: Europa barata\n"
+        f"{best['origin']} → {best['dest']} (ida/vuelta)\n"
+        f"Salida: {best['depart']} | Vuelta: {best['return']} ({best['duration_days']} días)\n"
+        f"Total: {best['total']:.2f} {best['currency']}\n"
+        f"Aerolínea(s): {airline_line}\n"
+    )
 
-    print("🧠 Analizando...")
-    df_ida['Fecha_dt'] = pd.to_datetime(df_ida['Fecha'])
-    df_vuelta['Fecha_dt'] = pd.to_datetime(df_vuelta['Fecha'])
-    
-    opciones = []
-    for _, f_ida in df_ida.iterrows():
-        salida = f_ida['Fecha_dt']
-        ini, fin = salida + timedelta(days=DIAS_MIN_ESTADIA), salida + timedelta(days=DIAS_MAX_ESTADIA)
-        vueltas = df_vuelta[(df_vuelta['Fecha_dt'] >= ini) & (df_vuelta['Fecha_dt'] <= fin)]
-        
-        for _, f_vuelta in vueltas.iterrows():
-            total = f_ida['Precio'] + f_vuelta['Precio']
-            if total <= PRECIO_OBJETIVO:
-                opciones.append({
-                    'Salida': f_ida['Fecha'], 'Regreso': f_vuelta['Fecha'],
-                    'Días': (f_vuelta['Fecha_dt'] - salida).days, 'TOTAL': total
-                })
-
-    if opciones:
-        df_final = pd.DataFrame(opciones).sort_values('TOTAL')
-        print(f"🎉 ÉXITO: {df_final.iloc[0]['TOTAL']} USD")
-        enviar_alerta(df_final)
+    if improved:
+        state = {
+            "best_total": best["total"],
+            "best_offer": best,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        state_save(state)
+        telegram_send(tg_token, tg_chat, msg)
+        log.info("Alerta enviada y best guardado en %s", STATE_FILE.name)
     else:
-        print("📉 Nada barato hoy.")
+        log.info("Encontré %.2f %s pero no mejora el best guardado (%s).", best["total"], currency, prev_best)
+        # opcional: igual avisar en telegram si querés
+        # telegram_send(tg_token, tg_chat, msg)
+
 
 if __name__ == "__main__":
-    ejecutar_bot()
+    main()
