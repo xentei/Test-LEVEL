@@ -81,7 +81,9 @@ def state_load() -> dict:
 
 
 def state_save(state: dict) -> None:
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path = STATE_FILE.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(STATE_FILE)
 
 
 # -----------------------------
@@ -95,6 +97,7 @@ class Amadeus:
         self.token = None
         self.token_exp = 0.0
         self.airline_name_cache = {}  # "IB" -> "Iberia"
+        self.session = requests.Session()
 
     def _token_valid(self) -> bool:
         return bool(self.token) and (time.time() < (self.token_exp - 30))
@@ -104,7 +107,7 @@ class Amadeus:
             return self.token
 
         url = f"{self.base}/v1/security/oauth2/token"
-        r = requests.post(
+        r = self.session.post(
             url,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             data={
@@ -129,7 +132,7 @@ class Amadeus:
 
         for attempt in range(1, retries + 1):
             try:
-                r = requests.request(method, url, headers=self._headers(), params=params, timeout=30)
+                r = self.session.request(method, url, headers=self._headers(), params=params, timeout=30)
 
                 # token expirado
                 if r.status_code == 401 and attempt < retries:
@@ -272,6 +275,23 @@ def main():
 
     if not am_id or not am_secret:
         raise RuntimeError("Faltan AMADEUS_CLIENT_ID / AMADEUS_CLIENT_SECRET en .env")
+
+    if not destinations:
+        raise RuntimeError("DESTINATIONS vacío o inválido en .env")
+    if start_in_days < 0:
+        raise RuntimeError("START_IN_DAYS debe ser >= 0")
+    if range_days <= 0:
+        raise RuntimeError("RANGE_DAYS debe ser > 0")
+    if step_days <= 0:
+        raise RuntimeError("STEP_DAYS debe ser > 0")
+    if dur_min <= 0 or dur_max <= 0 or dur_min > dur_max:
+        raise RuntimeError("DUR_MIN/DUR_MAX inválidos (deben ser > 0 y DUR_MIN <= DUR_MAX)")
+    if adults <= 0:
+        raise RuntimeError("ADULTS debe ser > 0")
+    if max_results <= 0:
+        raise RuntimeError("MAX debe ser > 0")
+    if max_price <= 0:
+        raise RuntimeError("MAX_PRICE debe ser > 0")
 
     am = Amadeus(am_env, am_id, am_secret)
     state = state_load()
